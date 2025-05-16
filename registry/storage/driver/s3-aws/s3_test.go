@@ -101,30 +101,34 @@ func init() {
 			}
 		}
 
+		if objectACL == "" {
+			objectACL = s3.ObjectCannedACLPrivate
+		}
+
 		parameters := DriverParameters{
-			accessKey,
-			secretKey,
-			bucket,
-			region,
-			regionEndpoint,
-			forcePathStyleBool,
-			encryptBool,
-			keyID,
-			secureBool,
-			skipVerifyBool,
-			v4Bool,
-			minChunkSize,
-			defaultMultipartCopyChunkSize,
-			defaultMultipartCopyMaxConcurrency,
-			defaultMultipartCopyThresholdSize,
-			rootDirectory,
-			storageClass,
-			driverName + "-test",
-			objectACL,
-			sessionToken,
-			useDualStackBool,
-			accelerateBool,
-			getS3LogLevelFromParam(logLevel),
+			AccessKey:                   accessKey,
+			SecretKey:                   secretKey,
+			Bucket:                      bucket,
+			Region:                      region,
+			RegionEndpoint:              regionEndpoint,
+			ForcePathStyle:              forcePathStyleBool,
+			Encrypt:                     encryptBool,
+			KeyID:                       keyID,
+			Secure:                      secureBool,
+			SkipVerify:                  skipVerifyBool,
+			V4Auth:                      v4Bool,
+			ChunkSize:                   minChunkSize,
+			MultipartCopyChunkSize:      defaultMultipartCopyChunkSize,
+			MultipartCopyMaxConcurrency: defaultMultipartCopyMaxConcurrency,
+			MultipartCopyThresholdSize:  defaultMultipartCopyThresholdSize,
+			RootDirectory:               rootDirectory,
+			StorageClass:                storageClass,
+			UserAgent:                   driverName + "-test",
+			ObjectACL:                   objectACL,
+			SessionToken:                sessionToken,
+			UseDualStack:                useDualStackBool,
+			Accelerate:                  accelerateBool,
+			LogLevel:                    getS3LogLevelFromParam(logLevel),
 		}
 
 		return New(context.Background(), parameters)
@@ -150,7 +154,11 @@ func newDriverConstructor(tb testing.TB) testsuites.DriverConstructor {
 
 func TestS3DriverSuite(t *testing.T) {
 	skipCheck(t)
-	testsuites.Driver(t, newDriverConstructor(t))
+	skipVerify, err := strconv.ParseBool(os.Getenv("S3_SKIP_VERIFY"))
+	if err != nil {
+		skipVerify = false
+	}
+	testsuites.Driver(t, newDriverConstructor(t), skipVerify)
 }
 
 func BenchmarkS3DriverSuite(b *testing.B) {

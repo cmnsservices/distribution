@@ -33,11 +33,12 @@ jobs:
       fail-fast: false
       matrix:
         go:
-          - 1.22.8
-          - 1.23.2
+          - 1.23.7
+          - 1.24.1
         target:
           - test-coverage
-          - test-cloud-storage
+          - test-s3-storage
+          - test-azure-storage
     steps:
       -
         name: Checkout
@@ -53,7 +54,7 @@ jobs:
           make ${{ matrix.target }}
       -
         name: Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           directory: ./
 
@@ -118,8 +119,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       -
         name: Build artifacts
-        uses: docker/bake-action@v5
+        uses: docker/bake-action@v6
         with:
+          source: .
           targets: artifact-all
       -
         name: Rename provenance
@@ -139,15 +141,16 @@ jobs:
           tree -nh ./bin
       -
         name: Upload artifacts
-        uses: actions/upload-artifact@v4.3.6
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: registry
           path: ./bin/*
           if-no-files-found: error
       -
         name: Build image
-        uses: docker/bake-action@v5
+        uses: docker/bake-action@v6
         with:
+          source: .
           files: |
             ./docker-bake.hcl
             ${{ steps.meta.outputs.bake-file }}
