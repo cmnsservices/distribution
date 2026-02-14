@@ -30,6 +30,15 @@ The registry is now ready to use.
 > continue to the [configuration guide](configuration.md) to deploy a
 > production-ready registry.
 
+> **Note**: The [default configuration](https://github.com/distribution/distribution/blob/main/cmd/registry/config-dev.yml)
+> is designed for development. As such, the log level is set to `debug`. In
+> addition, the registry uses [OpenTelemetry](https://opentelemetry.io/docs/what-is-opentelemetry/)
+> for logs and trace. OpenTelemetry integration is configured using [standard
+> environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/),
+> and will by default attempt to export telemetry traces to an OTLP collector at
+> `localhost:4318`. If this is not desired, telemetry can be disabled by adding
+> `-e OTEL_TRACES_EXPORTER=none` to the `docker run` command above.
+
 ## Copy an image from Docker Hub to your registry
 
 You can pull an image from Docker Hub and push it to your registry. The
@@ -504,9 +513,10 @@ registry:
     - /path/auth:/auth
 ```
 
+{{< hint type=warning >}}
 Replace `/path` with the directory which contains the `certs/` and `auth/`
 directories.
-{:.warning}
+{{< /hint >}}
 
 Start your registry by issuing the following command in the directory containing
 the `docker-compose.yml` file:

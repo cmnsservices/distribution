@@ -56,6 +56,12 @@ REGISTRY_HTTP_TLS_LETSENCRYPT_HOSTS_0=registry.example.com
 > be configured to tweak individual values. Overriding configuration sections
 > with environment variables is not recommended.
 
+### Disable traces export
+
+Currently traces are set to `https://localhost:4318/v1/traces` by default.
+You can control this by setting the [environment variable](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/#exporter-selection) `OTEL_TRACES_EXPORTER`
+to either `none` or your trace collector.
+
 ## Overriding the entire configuration file
 
 If the default configuration is not a sound basis for your usage, or if you are
@@ -156,6 +162,7 @@ storage:
     multipartcopythresholdsize: 33554432
     rootdirectory: /s3/object/name/prefix
     usedualstack: false
+    usefipsendpoint: false
     loglevel: debug
   inmemory:  # This driver takes no parameters
   tag:
@@ -268,7 +275,7 @@ redis:
   tls:
     certificate: /path/to/cert.crt
     key: /path/to/key.pem
-    clientcas:
+    rootcas:
       - /path/to/ca.pem
   addrs: [localhost:6379]
   password: asecret
@@ -449,6 +456,7 @@ storage:
     multipartcopymaxconcurrency: 100
     multipartcopythresholdsize: 33554432
     rootdirectory: /s3/object/name/prefix
+    usefipsendpoint: false
     loglevel: debug
   inmemory:
   delete:
@@ -1042,6 +1050,15 @@ accept event notifications.
 | `mediatypes`|no| A list of target media types to ignore. Events with these target media types are not published to the endpoint. |
 | `actions`   |no| A list of actions to ignore. Events with these actions are not published to the endpoint. |
 
+The `mediatypes` and `actions` filters work independently. You can specify:
+
+- Only `mediatypes` to filter by media type.
+- Only `actions` to filter by action (e.g., `pull`, `push`, `delete`, `mount`)
+- Both to filter events matching either condition (OR logic)
+- Neither to receive all events
+
+Common use case: Set `mediatypes: []` with `actions: [pull, delete, mount]` to receive only push events regardless of media type.
+
 ### `events`
 
 The `events` structure configures the information provided in event notifications.
@@ -1057,8 +1074,8 @@ may use the Redis instance for several applications. Currently, it caches
 information about immutable blobs. Most of the `redis` options control
 how the registry connects to the `redis` instance.
 
-You should configure Redis with the **allkeys-lru** eviction policy, because the
-registry does not set an expiration value on keys.
+You **must** configure Redis with the **allkeys-lru** eviction policy, because
+the registry does not set an expiration value on keys.
 
 Under the hood distribution uses [`go-redis`](https://github.com/redis/go-redis) Go module for
 Redis connectivity and its [`UniversalOptions`](https://pkg.go.dev/github.com/redis/go-redis/v9#UniversalOptions)
@@ -1072,14 +1089,14 @@ Use these settings to configure Redis TLS:
 |-----------|----------|-------------------------------------------------------|
 | `certificate`  | yes  | Absolute path to the x509 certificate file.           |
 | `key`          | yes  | Absolute path to the x509 private key file.           |
-| `clientcas`    | no   | An array of absolute paths to x509 CA files.          |
+| `rootcas`      | no   | An array of absolute paths to x509 CA files.          |
 
 ```yaml
 redis:
   tls:
     certificate: /path/to/cert.crt
     key: /path/to/key.pem
-    clientcas:
+    rootcas:
       - /path/to/ca.pem
   addrs: [localhost:6379]
   password: asecret

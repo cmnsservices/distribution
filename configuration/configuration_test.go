@@ -2,6 +2,7 @@ package configuration
 
 import (
 	"bytes"
+	"maps"
 	"net/http"
 	"reflect"
 	"strings"
@@ -17,7 +18,7 @@ var configStruct = Configuration{
 	Version: "0.1",
 	Log: Log{
 		Level:  "info",
-		Fields: map[string]interface{}{"environment": "test"},
+		Fields: map[string]any{"environment": "test"},
 	},
 	Storage: Storage{
 		"somedriver": Parameters{
@@ -90,7 +91,7 @@ var configStruct = Configuration{
 		TLS: RedisTLSOptions{
 			Certificate: "/foo/cert.crt",
 			Key:         "/foo/key.pem",
-			ClientCAs:   []string{"/path/to/ca.pem"},
+			RootCAs:     []string{"/path/to/ca.pem"},
 		},
 	},
 	Validation: Validation{
@@ -149,7 +150,7 @@ redis:
   tls:
     certificate: /foo/cert.crt
     key: /foo/key.pem
-    clientcas:
+    rootcas:
       - /path/to/ca.pem
   addrs: [localhost:6379]
   username: alice
@@ -394,10 +395,10 @@ func (suite *ConfigSuite) TestParseExtraneousVars() {
 // TestParseEnvVarImplicitMaps validates that environment variables can set
 // values in maps that don't already exist.
 func (suite *ConfigSuite) TestParseEnvVarImplicitMaps() {
-	readonly := make(map[string]interface{})
+	readonly := make(map[string]any)
 	readonly["enabled"] = true
 
-	maintenance := make(map[string]interface{})
+	maintenance := make(map[string]any)
 	maintenance["readonly"] = readonly
 
 	suite.expectedConfig.Storage["maintenance"] = maintenance
@@ -496,7 +497,7 @@ func checkStructs(tt *testing.T, t reflect.Type, structsChecked map[string]struc
 // with yaml tags that would be ambiguous to the environment variable parser.
 func (suite *ConfigSuite) TestValidateConfigStruct() {
 	structsChecked := make(map[string]struct{})
-	checkStructs(suite.T(), reflect.TypeOf(Configuration{}), structsChecked)
+	checkStructs(suite.T(), reflect.TypeFor[Configuration](), structsChecked)
 }
 
 func copyConfig(config Configuration) *Configuration {
@@ -506,10 +507,8 @@ func copyConfig(config Configuration) *Configuration {
 	configCopy.Loglevel = config.Loglevel
 	configCopy.Log = config.Log
 	configCopy.Catalog = config.Catalog
-	configCopy.Log.Fields = make(map[string]interface{}, len(config.Log.Fields))
-	for k, v := range config.Log.Fields {
-		configCopy.Log.Fields[k] = v
-	}
+	configCopy.Log.Fields = make(map[string]any, len(config.Log.Fields))
+	maps.Copy(configCopy.Log.Fields, config.Log.Fields)
 
 	configCopy.Storage = Storage{config.Storage.Type(): Parameters{}}
 	for k, v := range config.Storage.Parameters() {
@@ -528,9 +527,7 @@ func copyConfig(config Configuration) *Configuration {
 	configCopy.Notifications.Endpoints = append(configCopy.Notifications.Endpoints, config.Notifications.Endpoints...)
 
 	configCopy.HTTP.Headers = make(http.Header)
-	for k, v := range config.HTTP.Headers {
-		configCopy.HTTP.Headers[k] = v
-	}
+	maps.Copy(configCopy.HTTP.Headers, config.HTTP.Headers)
 	configCopy.HTTP.TLS.ClientCAs = make([]string, 0, len(config.HTTP.TLS.ClientCAs))
 	configCopy.HTTP.TLS.ClientCAs = append(configCopy.HTTP.TLS.ClientCAs, config.HTTP.TLS.ClientCAs...)
 	configCopy.HTTP.TLS.ClientAuth = config.HTTP.TLS.ClientAuth
@@ -538,8 +535,8 @@ func copyConfig(config Configuration) *Configuration {
 	configCopy.Redis = config.Redis
 	configCopy.Redis.TLS.Certificate = config.Redis.TLS.Certificate
 	configCopy.Redis.TLS.Key = config.Redis.TLS.Key
-	configCopy.Redis.TLS.ClientCAs = make([]string, 0, len(config.Redis.TLS.ClientCAs))
-	configCopy.Redis.TLS.ClientCAs = append(configCopy.Redis.TLS.ClientCAs, config.Redis.TLS.ClientCAs...)
+	configCopy.Redis.TLS.RootCAs = make([]string, 0, len(config.Redis.TLS.RootCAs))
+	configCopy.Redis.TLS.RootCAs = append(configCopy.Redis.TLS.RootCAs, config.Redis.TLS.RootCAs...)
 
 	configCopy.Validation = Validation{
 		Enabled:   config.Validation.Enabled,

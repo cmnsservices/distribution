@@ -33,8 +33,8 @@ jobs:
       fail-fast: false
       matrix:
         go:
-          - 1.23.7
-          - 1.24.1
+          - 1.24.x
+          - 1.25.7
         target:
           - test-coverage
           - test-s3-storage
@@ -42,10 +42,10 @@ jobs:
     steps:
       -
         name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
       -
         name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
       -
@@ -69,7 +69,7 @@ jobs:
     steps:
       -
         name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
         with:
           fetch-depth: 0
       -
@@ -141,7 +141,7 @@ jobs:
           tree -nh ./bin
       -
         name: Upload artifacts
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@v6.0.0
         with:
           name: registry
           path: ./bin/*
