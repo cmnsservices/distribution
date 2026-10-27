@@ -18,12 +18,14 @@ import (
 )
 
 type proxyBlobStore struct {
-	localStore     distribution.BlobStore
-	remoteStore    distribution.BlobService
-	scheduler      *scheduler.TTLExpirationScheduler
-	ttl            *time.Duration
-	repositoryName reference.Named
-	authChallenger authChallenger
+	localStore        distribution.BlobStore
+	remoteStore       distribution.BlobStore
+	scheduler         *scheduler.TTLExpirationScheduler
+	ttl               *time.Duration
+	cacheWriteTimeout time.Duration
+	rangePassthrough  bool
+	repositoryName    reference.Named
+	authChallenger    authChallenger
 }
 
 var _ distribution.BlobStore = &proxyBlobStore{}
@@ -79,6 +81,24 @@ func (pbs *proxyBlobStore) serveLocal(ctx context.Context, w http.ResponseWriter
 	return true, pbs.localStore.ServeBlob(ctx, w, r, dgst)
 }
 
+func (pbs *proxyBlobStore) serveBlobRange(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) (bool, error) {
+	if !pbs.rangePassthrough || r.Method != http.MethodGet || r.Header.Get("Range") == "" {
+		return false, nil
+	}
+
+	// Range responses, including a full 200 fallback, never enter the cache
+	// writer or the digest-wide inflight path.
+	ctx, w = dcontext.WithResponseWriter(ctx, w)
+	err := pbs.remoteStore.ServeBlob(ctx, w, r, dgst)
+	status := ctx.Value("http.response.status")
+	if err == nil && (status == http.StatusOK || status == http.StatusPartialContent) {
+		written := ctx.Value("http.response.written").(int64)
+		proxyMetrics.BlobPull(uint64(written))
+		proxyMetrics.BlobPush(uint64(written), false)
+	}
+	return true, err
+}
+
 func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
 	served, err := pbs.serveLocal(ctx, w, r, dgst)
 	if err != nil {
@@ -91,6 +111,10 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 	}
 
 	if err := pbs.authChallenger.tryEstablishChallenges(ctx); err != nil {
+		return err
+	}
+
+	if served, err := pbs.serveBlobRange(ctx, w, r, dgst); served || err != nil {
 		return err
 	}
 
@@ -113,10 +137,27 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 		mu.Unlock()
 	}()
 
-	bw, err := pbs.localStore.Create(ctx)
+	// Create a detached context for the blob writer that won't be canceled
+	// when the HTTP request context is canceled. This allows the cache write
+	// to complete even if the client disconnects.
+	// Use the configured timeout to prevent hanging operations.
+	writerCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pbs.cacheWriteTimeout)
+	defer cancel()
+
+	bw, err := pbs.localStore.Create(writerCtx)
 	if err != nil {
 		return err
 	}
+
+	committed := false
+	// Ensure the writer is canceled if we return early with an error
+	defer func() {
+		if !committed {
+			if err := bw.Cancel(writerCtx); err != nil {
+				dcontext.GetLogger(ctx).WithError(err).Errorf("Error canceling blob writer")
+			}
+		}
+	}()
 
 	// Serving client and storing locally over same fetching request.
 	// This can prevent a redundant blob fetching.
@@ -126,10 +167,12 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 		return err
 	}
 
-	_, err = bw.Commit(ctx, desc)
+	_, err = bw.Commit(writerCtx, desc)
 	if err != nil {
 		return err
 	}
+
+	committed = true
 
 	blobRef, err := reference.WithDigest(pbs.repositoryName, dgst)
 	if err != nil {

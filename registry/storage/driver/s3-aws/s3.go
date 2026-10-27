@@ -20,7 +20,8 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"path/filepath"
+	"net/url"
+	"path"
 	"slices"
 	"sort"
 	"strconv"
@@ -82,6 +83,7 @@ var s3StorageClasses = []string{
 	s3.StorageClassIntelligentTiering,
 	s3.StorageClassOutposts,
 	s3.StorageClassGlacierIr,
+	s3.StorageClassExpressOnezone,
 }
 
 // validRegions maps known s3 region identifiers to region descriptors
@@ -116,6 +118,7 @@ type DriverParameters struct {
 	Accelerate                  bool
 	UseFIPSEndpoint             bool
 	LogLevel                    aws.LogLevelType
+	RedirectEndpoint            string
 }
 
 func init() {
@@ -164,6 +167,7 @@ type driver struct {
 	RootDirectory               string
 	StorageClass                string
 	ObjectACL                   string
+	RedirectEndpoint            *url.URL
 	pool                        *sync.Pool
 }
 
@@ -288,14 +292,7 @@ func FromParameters(ctx context.Context, parameters map[string]any) (*Driver, er
 		}
 		// All valid storage class parameters are UPPERCASE, so be a bit more flexible here
 		storageClassString = strings.ToUpper(storageClassString)
-		if storageClassString != noStorageClass &&
-			storageClassString != s3.StorageClassStandard &&
-			storageClassString != s3.StorageClassReducedRedundancy &&
-			storageClassString != s3.StorageClassStandardIa &&
-			storageClassString != s3.StorageClassOnezoneIa &&
-			storageClassString != s3.StorageClassIntelligentTiering &&
-			storageClassString != s3.StorageClassOutposts &&
-			storageClassString != s3.StorageClassGlacierIr {
+		if !slices.Contains(s3StorageClasses, storageClassString) {
 			return nil, fmt.Errorf(
 				"the storageclass parameter must be one of %v, %v invalid",
 				s3StorageClasses,
@@ -341,6 +338,11 @@ func FromParameters(ctx context.Context, parameters map[string]any) (*Driver, er
 		return nil, err
 	}
 
+	redirectEndpoint := parameters["redirectendpoint"]
+	if redirectEndpoint == nil {
+		redirectEndpoint = ""
+	}
+
 	params := DriverParameters{
 		AccessKey:                   fmt.Sprint(accessKey),
 		SecretKey:                   fmt.Sprint(secretKey),
@@ -366,6 +368,7 @@ func FromParameters(ctx context.Context, parameters map[string]any) (*Driver, er
 		Accelerate:                  accelerateBool,
 		UseFIPSEndpoint:             useFIPSEndpointBool,
 		LogLevel:                    getS3LogLevelFromParam(parameters["loglevel"]),
+		RedirectEndpoint:            fmt.Sprint(redirectEndpoint),
 	}
 
 	return New(ctx, params)
@@ -541,6 +544,29 @@ func New(ctx context.Context, params DriverParameters) (*Driver, error) {
 		pool: &sync.Pool{
 			New: func() any { return &bytes.Buffer{} },
 		},
+	}
+
+	if params.RedirectEndpoint != "" {
+		u, err := url.Parse(params.RedirectEndpoint)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse redirectendpoint: %w", err)
+		}
+		if u.Scheme == "" {
+			return nil, fmt.Errorf("no scheme specified for redirectendpoint")
+		}
+		if u.Host == "" {
+			return nil, fmt.Errorf("no host specified for redirectendpoint")
+		}
+		// Edge Case: Reject trailing paths (e.g., /cdn/v1) because the hot path ignores them
+		if u.Path != "" && u.Path != "/" {
+			return nil, fmt.Errorf("redirectendpoint cannot contain a base path: %s", u.Path)
+		}
+		// Edge Case: Reject query parameters because they break AWS SigV4 signatures
+		if u.RawQuery != "" {
+			return nil, fmt.Errorf("redirectendpoint cannot contain query parameters")
+		}
+
+		d.RedirectEndpoint = u
 	}
 
 	return &Driver{
@@ -1047,6 +1073,13 @@ func (d *driver) RedirectURL(r *http.Request, path string) (string, error) {
 		return "", nil
 	}
 
+	// If a public redirect endpoint is configured, use it for the signed URL
+	// This allows using a different public endpoint for downloads with signed URLs
+	if d.RedirectEndpoint != nil && req.HTTPRequest != nil {
+		req.HTTPRequest.URL.Host = d.RedirectEndpoint.Host
+		req.HTTPRequest.URL.Scheme = d.RedirectEndpoint.Scheme
+	}
+
 	return req.Presign(expiresIn)
 }
 
@@ -1145,7 +1178,7 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, from, sta
 
 		for _, walkInfo := range walkInfos {
 			// skip any results under the last skip directory
-			if prevSkipDir != "" && strings.HasPrefix(walkInfo.Path(), prevSkipDir) {
+			if isSubpath(walkInfo.Path(), prevSkipDir) {
 				continue
 			}
 
@@ -1197,6 +1230,11 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, from, sta
 //
 //	directoryDiff("/", "/path/to/folder/folder/file")
 //	// => [ "/path", "/path/to", "/path/to/folder", "/path/to/folder/folder" ]
+//
+// prev and current are S3 object keys, which always use "/" as a separator
+// regardless of host OS, so this must use path.Dir rather than filepath.Dir:
+// on Windows, filepath.Dir converges to "\" instead of "/", so the loop's
+// "/" exit condition never fires and it never terminates.
 func directoryDiff(prev, current string) []string {
 	var paths []string
 
@@ -1206,7 +1244,7 @@ func directoryDiff(prev, current string) []string {
 
 	parent := current
 	for {
-		parent = filepath.Dir(parent)
+		parent = path.Dir(parent)
 		if parent == "/" || parent == prev || strings.HasPrefix(prev+"/", parent+"/") {
 			break
 		}
@@ -1214,6 +1252,19 @@ func directoryDiff(prev, current string) []string {
 	}
 	slices.Reverse(paths)
 	return paths
+}
+
+func isSubpath(path, parent string) bool {
+	if parent == "" {
+		return false
+	}
+	if path == parent {
+		return true
+	}
+	if parent == "/" {
+		return strings.HasPrefix(path, "/")
+	}
+	return strings.HasPrefix(path, parent+"/")
 }
 
 func (d *driver) s3Path(path string) string {

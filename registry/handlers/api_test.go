@@ -28,6 +28,7 @@ import (
 	v2 "github.com/distribution/distribution/v3/registry/api/v2"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
+	_ "github.com/distribution/distribution/v3/registry/storage/driver/filesystem"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/distribution/distribution/v3/testutil"
 	"github.com/distribution/reference"
@@ -547,6 +548,12 @@ func TestTagsAPI(t *testing.T) {
 			}},
 		},
 		{
+			name:               "page after last tag",
+			queryParams:        url.Values{"last": []string{"sb71y"}, "n": []string{"1"}},
+			expectedStatusCode: http.StatusOK,
+			expectedBody:       tagsAPIResponse{Name: imageName.Name(), Tags: []string{}},
+		},
+		{
 			name:               "page size bigger than full list",
 			queryParams:        url.Values{"n": []string{"100"}},
 			expectedStatusCode: http.StatusOK,
@@ -566,9 +573,11 @@ func TestTagsAPI(t *testing.T) {
 			queryParams:        url.Values{"last": []string{"does-not-exist"}, "n": []string{"3"}},
 			expectedStatusCode: http.StatusOK,
 			expectedBody: tagsAPIResponse{Name: imageName.Name(), Tags: []string{
+				"jyi7b",
 				"kb0j5",
 				"sb71y",
 			}},
+			expectedLinkHeader: `</v2/test/tags/list?last=sb71y&n=3>; rel="next"`,
 		},
 	}
 
@@ -599,7 +608,7 @@ func TestTagsAPI(t *testing.T) {
 					t.Fatalf("unexpected error decoding response body: %v", err)
 				}
 				if !reflect.DeepEqual(body, test.expectedBody) {
-					t.Fatalf("expected response body to be:\n%+v\ngot:\n%+v", test.expectedBody, body)
+					t.Fatalf("expected response body to be:\n%#v\ngot:\n%#v", test.expectedBody, body)
 				}
 			}
 
@@ -607,6 +616,63 @@ func TestTagsAPI(t *testing.T) {
 				t.Fatalf("expected response Link header to be %q, got %q", test.expectedLinkHeader, resp.Header.Get("Link"))
 			}
 		})
+	}
+}
+
+// TestTagsAPIMaxTagsClamp verifies that the tags/list endpoint clamps an n
+// query parameter greater than the server's configured MaxTags down to MaxTags
+// rather than returning 400 — the OCI distribution-spec permits a server to
+// return fewer than n results when a Link header is provided.
+func TestTagsAPIMaxTagsClamp(t *testing.T) {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"inmemory":    configuration.Parameters{},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{"enabled": false}},
+		},
+		Catalog: configuration.Catalog{MaxEntries: 5},
+		Tags:    configuration.Tags{MaxTags: 2},
+	}
+	config.HTTP.Headers = headerConfig
+	env := newTestEnvWithConfig(t, &config)
+	defer env.Shutdown()
+
+	imageName, err := reference.WithName("test")
+	if err != nil {
+		t.Fatalf("unable to parse reference: %v", err)
+	}
+
+	tags := []string{"2j2ar", "asj9e", "jyi7b", "kb0j5", "sb71y"}
+	for _, tag := range tags {
+		createRepository(env, t, imageName.Name(), tag)
+	}
+
+	tagsURL, err := env.builder.BuildTagsURL(imageName, url.Values{"n": []string{"100"}})
+	if err != nil {
+		t.Fatalf("unexpected error building tags URL: %v", err)
+	}
+
+	resp, err := http.Get(tagsURL)
+	if err != nil {
+		t.Fatalf("unexpected error issuing request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected response status code to be %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var body tagsAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("unexpected error decoding response body: %v", err)
+	}
+	expected := tagsAPIResponse{Name: imageName.Name(), Tags: []string{"2j2ar", "asj9e"}}
+	if !reflect.DeepEqual(body, expected) {
+		t.Fatalf("expected response body to be:\n%+v\ngot:\n%+v", expected, body)
+	}
+
+	wantLink := `</v2/test/tags/list?last=asj9e&n=2>; rel="next"`
+	if got := resp.Header.Get("Link"); got != wantLink {
+		t.Fatalf("expected response Link header to be %q, got %q", wantLink, got)
 	}
 }
 
@@ -706,6 +772,21 @@ func TestBlobAPI(t *testing.T) {
 	defer env2.Shutdown()
 	args = makeBlobArgs(t)
 	testBlobAPI(t, env2, args)
+}
+
+func TestBlobAPIFilesystem(t *testing.T) {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"filesystem": configuration.Parameters{"rootdirectory": t.TempDir()},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
+				"enabled": false,
+			}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+	env := newTestEnvWithConfig(t, &config)
+	defer env.Shutdown()
+	testBlobAPI(t, env, makeBlobArgs(t))
 }
 
 func TestBlobDelete(t *testing.T) {
@@ -1302,7 +1383,7 @@ func TestManifestAPI(t *testing.T) {
 }
 
 func TestManifestAPI_DeleteTag(t *testing.T) {
-	env := newTestEnv(t, false)
+	env := newTestEnv(t, true)
 	defer env.Shutdown()
 
 	imageName, err := reference.WithName("foo/bar")
@@ -1347,7 +1428,7 @@ func TestManifestAPI_DeleteTag(t *testing.T) {
 }
 
 func TestManifestAPI_DeleteTag_Unknown(t *testing.T) {
-	env := newTestEnv(t, false)
+	env := newTestEnv(t, true)
 	defer env.Shutdown()
 
 	imageName, err := reference.WithName("foo/bar")
@@ -1389,6 +1470,76 @@ func TestManifestAPI_DeleteTag_ReadOnly(t *testing.T) {
 	defer resp.Body.Close()
 
 	checkResponse(t, msg, resp, http.StatusMethodNotAllowed)
+}
+
+func TestManifestAPI_DeleteTag_DeleteDisabled(t *testing.T) {
+	env := newTestEnv(t, false)
+	defer env.Shutdown()
+
+	imageName, err := reference.WithName("foo/bar")
+	checkErr(t, err, "building named object")
+
+	tag := "latest"
+	createRepository(env, t, imageName.Name(), tag)
+
+	ref, err := reference.WithTag(imageName, tag)
+	checkErr(t, err, "building tag reference")
+
+	u, err := env.builder.BuildManifestURL(ref)
+	checkErr(t, err, "building tag URL")
+
+	resp, err := httpDelete(u)
+	msg := "deleting tag with delete disabled"
+	checkErr(t, err, msg)
+	defer resp.Body.Close()
+
+	checkResponse(t, msg, resp, http.StatusMethodNotAllowed)
+	// nolint:errcheck
+	checkBodyHasErrorCodes(t, msg, resp, errcode.ErrorCodeUnsupported)
+
+	msg = "checking tag exists after rejected delete"
+	resp, err = http.Get(u)
+	checkErr(t, err, msg)
+	defer resp.Body.Close()
+	checkResponse(t, msg, resp, http.StatusOK)
+}
+
+func TestManifestAPI_NameTooLong(t *testing.T) {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"inmemory":    configuration.Parameters{},
+			"cache":       configuration.Parameters{"blobdescriptor": "inmemory"},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{"enabled": false}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+	env := newTestEnvWithConfig(t, &config)
+	defer env.Shutdown()
+
+	// "foo" is a domain to WithName but part of the path (docker.io/foo/...) to the cache.
+	for _, tc := range []struct {
+		name string
+		repo string
+	}{
+		{
+			name: "rejected by reference.WithName",
+			repo: "foo/" + strings.Repeat("a", reference.RepositoryNameTotalLengthMax+1),
+		},
+		{
+			name: "rejected by the blob descriptor cache",
+			repo: "foo/" + strings.Repeat("a", reference.RepositoryNameTotalLengthMax),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Get(env.server.URL + "/v2/" + tc.repo + "/manifests/latest")
+			checkErr(t, err, tc.name)
+			defer resp.Body.Close()
+
+			checkResponse(t, tc.name, resp, http.StatusBadRequest)
+			// nolint:errcheck
+			checkBodyHasErrorCodes(t, tc.name, resp, errcode.ErrorCodeNameInvalid)
+		})
+	}
 }
 
 // storageManifestErrDriverFactory implements the factory.StorageDriverFactory interface.
@@ -2253,6 +2404,9 @@ func newTestEnv(t *testing.T, deleteEnabled bool) *testEnv {
 		},
 		Catalog: configuration.Catalog{
 			MaxEntries: 5,
+		},
+		Tags: configuration.Tags{
+			MaxTags: 1000,
 		},
 	}
 

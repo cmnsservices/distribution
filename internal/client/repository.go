@@ -344,7 +344,67 @@ func (t *tags) Lookup(ctx context.Context, digest v1.Descriptor) ([]string, erro
 	panic("not implemented")
 }
 
-func (t *tags) Tag(ctx context.Context, tag string, desc v1.Descriptor) error {
+func (t *tags) List(ctx context.Context, limit int, last string) ([]string, error) {
+	if limit < 0 {
+		tags, err := t.All(ctx)
+		if err != nil {
+			return tags, err
+		}
+		// return io.EOF, indicating that there are no more tags to list
+		return tags, io.EOF
+	}
+	v := url.Values{}
+	v.Add("n", strconv.Itoa(limit))
+	if last != "" {
+		v.Add("last", last)
+	}
+	listURLStr, err := t.ub.BuildTagsURL(t.name, v)
+	if err != nil {
+		return nil, err
+	}
+
+	listURL, err := url.Parse(listURLStr)
+	if err != nil {
+		return nil, err
+	}
+
+	preAlloc := min(limit, 1000)
+	tags := make([]string, 0, preAlloc)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, listURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return tags, err
+	}
+	defer resp.Body.Close()
+
+	if err := HandleHTTPResponseError(resp); err != nil {
+		return tags, err
+	}
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return tags, err
+	}
+
+	tagsResponse := struct {
+		Tags []string `json:"tags"`
+	}{}
+	if err := json.Unmarshal(b, &tagsResponse); err != nil {
+		return tags, err
+	}
+	tags = append(tags, tagsResponse.Tags...)
+	// if there is a Link header, return nil to indicate that there are more tags to list
+	// otherwise return io.EOF to indicate that there are no more tags to list
+	if link := resp.Header.Get("Link"); link != "" {
+		return tags, nil
+	}
+	return tags, io.EOF
+}
+
+func (t *tags) Tag(ctx context.Context, tag string, desc distribution.Descriptor) error {
 	panic("not implemented")
 }
 
@@ -476,6 +536,10 @@ func (ms *manifests) Get(ctx context.Context, dgst digest.Digest, options ...dis
 		}
 	}
 
+	// byDigest records whether the caller pinned the manifest by digest (as
+	// opposed to fetching by tag). When true, the returned content must hash to
+	// the requested digest.
+	byDigest := digestOrTag == ""
 	if digestOrTag == "" {
 		digestOrTag = dgst.String()
 		ref, err = reference.WithDigest(ms.name, dgst)
@@ -529,6 +593,28 @@ func (ms *manifests) Get(ctx context.Context, dgst digest.Digest, options ...dis
 	if err != nil {
 		return nil, err
 	}
+
+	// When the manifest was requested by digest, verify that the content the
+	// registry returned actually hashes to that digest. The server-supplied
+	// Docker-Content-Digest header is not trustworthy: a malicious registry or
+	// a MITM can forge it while serving arbitrary bytes. Without this check,
+	// digest pinning provides no integrity guarantee.
+	if byDigest {
+		// Reject a digest whose algorithm is unsupported/unavailable rather
+		// than letting dgst.Verifier() panic; such a digest cannot be verified,
+		// so fail closed.
+		if err := dgst.Validate(); err != nil {
+			return nil, err
+		}
+		verifier := dgst.Verifier()
+		if _, err := verifier.Write(body); err != nil {
+			return nil, err
+		}
+		if !verifier.Verified() {
+			return nil, fmt.Errorf("manifest digest mismatch: requested %s but received content does not match", dgst)
+		}
+	}
+
 	m, _, err := distribution.UnmarshalManifest(mt, body)
 	if err != nil {
 		return nil, err
@@ -659,16 +745,45 @@ func (bs *blobs) Stat(ctx context.Context, dgst digest.Digest) (v1.Descriptor, e
 	return bs.statter.Stat(ctx, dgst)
 }
 
+// Get fetches the blob for dgst and verifies that the returned content hashes
+// to it. Because the blob is content-addressed, a malicious registry or a MITM
+// can serve arbitrary bytes for a digest-pinned request; buffering and hashing
+// the whole body is what makes digest pinning meaningful. Callers that need an
+// integrity guarantee should use Get rather than Open (see Open).
 func (bs *blobs) Get(ctx context.Context, dgst digest.Digest) ([]byte, error) {
+	// Reject a digest whose algorithm is unsupported/unavailable rather than
+	// letting dgst.Verifier() panic; such a digest cannot be verified, so fail
+	// closed.
+	if err := dgst.Validate(); err != nil {
+		return nil, err
+	}
 	reader, err := bs.Open(ctx, dgst)
 	if err != nil {
 		return nil, err
 	}
 	defer reader.Close()
 
-	return io.ReadAll(reader)
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	verifier := dgst.Verifier()
+	if _, err := verifier.Write(body); err != nil {
+		return nil, err
+	}
+	if !verifier.Verified() {
+		return nil, fmt.Errorf("blob digest mismatch: requested %s but received content does not match", dgst)
+	}
+	return body, nil
 }
 
+// Open returns a reader that streams the blob for dgst. The returned content is
+// NOT verified against dgst: a content digest can only be checked once the whole
+// blob has been read, but Open hands bytes to the caller as they stream (and a
+// caller may read only part of the blob or seek), so verification cannot be
+// guaranteed in a single pass. Callers that rely on the digest for integrity
+// must use Get, which buffers and verifies the entire blob before returning it.
 func (bs *blobs) Open(ctx context.Context, dgst digest.Digest) (io.ReadSeekCloser, error) {
 	ref, err := reference.WithDigest(bs.name, dgst)
 	if err != nil {
@@ -688,6 +803,10 @@ func (bs *blobs) Open(ctx context.Context, dgst digest.Digest) (io.ReadSeekClose
 }
 
 func (bs *blobs) ServeBlob(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
+	if r.Method == http.MethodGet && r.Header.Get("Range") != "" {
+		return bs.serveBlobRange(ctx, w, r, dgst)
+	}
+
 	desc, err := bs.statter.Stat(ctx, dgst)
 	if err != nil {
 		return err
@@ -710,6 +829,77 @@ func (bs *blobs) ServeBlob(ctx context.Context, w http.ResponseWriter, r *http.R
 
 	_, err = io.CopyN(w, blob, desc.Size)
 	return err
+}
+
+// serveBlobRange relays the origin representation without interpreting ranges
+// or verifying the whole blob digest. The caller must not cache this response.
+func (bs *blobs) serveBlobRange(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
+	ref, err := reference.WithDigest(bs.name, dgst)
+	if err != nil {
+		return err
+	}
+	blobURL, err := bs.ub.BuildBlobURL(ref)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, blobURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Range", r.Header.Get("Range"))
+	if value := r.Header.Get("If-Range"); value != "" {
+		req.Header.Set("If-Range", value)
+	}
+	// Byte offsets refer to the encoded representation. Prevent the transport
+	// from requesting gzip and transparently decoding the origin response.
+	req.Header.Set("Accept-Encoding", "identity")
+	resp, err := bs.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusPartialContent, http.StatusRequestedRangeNotSatisfiable:
+	case http.StatusNotFound:
+		return distribution.ErrBlobUnknown
+	default:
+		if err := HandleHTTPResponseError(resp); err != nil {
+			return err
+		}
+		return &UnexpectedHTTPStatusError{Status: resp.Status}
+	}
+
+	// Forward representation metadata, excluding even allowlisted fields named
+	// by Connection. Never relay origin cookies or hop-by-hop headers.
+	headers := resp.Header.Clone()
+	for _, value := range headers.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			headers.Del(strings.TrimSpace(name))
+		}
+	}
+	for _, name := range []string{
+		"Content-Type", "Content-Length", "Content-Range", "Content-Encoding",
+		"Accept-Ranges", "Etag", "Last-Modified", "Cache-Control", "Expires", "Vary",
+		"Docker-Content-Digest",
+	} {
+		w.Header().Del(name)
+		for _, value := range headers.Values(name) {
+			w.Header().Add(name, value)
+		}
+	}
+	// Redirect targets may omit registry metadata. Use the resolved blob digest
+	// when a successful response does not provide one.
+	if (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) &&
+		w.Header().Get("Docker-Content-Digest") == "" {
+		w.Header().Set("Docker-Content-Digest", dgst.String())
+	}
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		// Headers and possibly binary data have already been sent. Returning an
+		// error would let the registry append JSON to an incomplete response.
+		panic(http.ErrAbortHandler)
+	}
+	return nil
 }
 
 func (bs *blobs) Put(ctx context.Context, mediaType string, p []byte) (v1.Descriptor, error) {

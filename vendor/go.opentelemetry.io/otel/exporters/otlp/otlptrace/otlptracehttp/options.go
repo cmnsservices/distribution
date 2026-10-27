@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-package otlptracehttp // import "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+package otlptracehttp
 
 import (
 	"crypto/tls"
@@ -93,6 +93,11 @@ func WithEndpoint(endpoint string) Option {
 //
 // If an invalid URL is provided, the default value will be kept.
 //
+// The path of the provided URL is used as-is; with one exception: if the URL has
+// no path, it is normalized to the root path ("/"). The default traces path
+// ("/v1/traces") is not appended automatically. Use WithEndpoint if you want
+// that behavior, or pass a URL that includes that path.
+//
 // By default, if an environment variable is not set, and this option is not
 // passed, "localhost:4318" will be used.
 //
@@ -138,6 +143,16 @@ func WithTimeout(duration time.Duration) Option {
 	return wrappedOption{otlpconfig.WithTimeout(duration)}
 }
 
+// WithMaxRequestSize sets the maximum size, in bytes, of a serialized export
+// request, before compression, that the exporter will send.
+//
+// If size is less than or equal to zero, no request-size limit is applied.
+// Disabling the limit is not recommended because it can lead to excessive
+// resource consumption or abuse.
+func WithMaxRequestSize(size int) Option {
+	return wrappedOption{otlpconfig.WithMaxRequestSize(size)}
+}
+
 // WithRetry configures the retry policy for transient errors that may occurs
 // when exporting traces. An exponential back-off algorithm is used to ensure
 // endpoints are not overwhelmed with retries. If unset, the default retry
@@ -152,4 +167,20 @@ func WithRetry(rc RetryConfig) Option {
 // will use [http.ProxyFromEnvironment].
 func WithProxy(pf HTTPTransportProxyFunc) Option {
 	return wrappedOption{otlpconfig.WithProxy(otlpconfig.HTTPTransportProxyFunc(pf))}
+}
+
+// WithHTTPClient sets the HTTP client to used by the exporter.
+//
+// This option will take precedence over [WithProxy], [WithTimeout],
+// [WithTLSClientConfig] options as well as OTEL_EXPORTER_OTLP_CERTIFICATE,
+// OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE, OTEL_EXPORTER_OTLP_TIMEOUT,
+// OTEL_EXPORTER_OTLP_TRACES_TIMEOUT environment variables.
+//
+// Timeout and all other fields of the passed [http.Client] are left intact.
+//
+// Be aware that passing an HTTP client with transport like
+// [go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp.NewTransport] can
+// cause the client to be instrumented twice and cause infinite recursion.
+func WithHTTPClient(c *http.Client) Option {
+	return wrappedOption{otlpconfig.WithHTTPClient(c)}
 }

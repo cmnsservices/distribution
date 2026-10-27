@@ -25,6 +25,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -167,7 +168,7 @@ func FromParameters(ctx context.Context, parameters map[string]any) (storagedriv
 			return nil, err
 		}
 		ts = jwtConf.TokenSource(ctx)
-		options = append(options, option.WithCredentialsFile(fmt.Sprint(keyfile)))
+		options = append(options, option.WithAuthCredentialsJSON(option.ServiceAccount, jsonKey))
 	} else if credentials, ok := parameters["credentials"]; ok {
 		credentialMap, ok := credentials.(map[any]any)
 		if !ok {
@@ -193,7 +194,7 @@ func FromParameters(ctx context.Context, parameters map[string]any) (storagedriv
 			return nil, err
 		}
 		ts = jwtConf.TokenSource(ctx)
-		options = append(options, option.WithCredentialsJSON(data))
+		options = append(options, option.WithAuthCredentialsJSON(option.ServiceAccount, data))
 	} else {
 		var err error
 		// DefaultTokenSource is a convenience method. It first calls FindDefaultCredentials,
@@ -423,16 +424,16 @@ func (d *driver) putContent(ctx context.Context, obj *storage.ObjectHandle, cont
 	wc.ContentType = contentType
 	wc.ChunkSize = d.chunkSize
 
-	if _, err := bytes.NewReader(content).WriteTo(wc); err != nil {
-		return err
-	}
-	// NOTE(milosgajdos): Apparently it's posisble to to upload 0-byte content to GCS.
+	// NOTE(milosgajdos): Apparently it's possible to upload 0-byte content to GCS.
 	// Setting MD5 on the Writer helps to prevent presisting that data.
 	// If set, the uploaded data is rejected if its MD5 hash does not match this field.
 	// See: https://pkg.go.dev/cloud.google.com/go/storage#ObjectAttrs
-	h := md5.New()
-	h.Write(content)
-	wc.MD5 = h.Sum(nil)
+	sum := md5.Sum(content)
+	wc.MD5 = sum[:]
+
+	if _, err := bytes.NewReader(content).WriteTo(wc); err != nil {
+		return err
+	}
 
 	return wc.Close()
 }
@@ -767,8 +768,8 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 		// docs: Objects will be iterated over lexicographically by name.
 		// This means we don't have to reverse order the slice; we can
 		// range over the keys slice in reverse order
-		for i := len(keys) - 1; i >= 0; i-- {
-			key := keys[i]
+		for _, v := range slices.Backward(keys) {
+			key := v
 			err := d.bucket.Object(key).Delete(ctx)
 			// GCS only guarantees eventual consistency, so listAll might return
 			// paths that no longer exist. If this happens, just ignore any not
